@@ -1,92 +1,136 @@
 // ============================================================
-// CITYSIGNAL — SCRAPER
-// Fetches real Montgomery Reddit posts and pushes to Supabase
+// CITYSIGNAL — MULTI-SOURCE SCRAPER v2
+// Fetches from multiple sources and skips duplicates
 // Run with: node scraper.js
 // ============================================================
 
 const SUPABASE_URL = "https://bfoimncmtvounnsxqvfi.supabase.co";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJmb2ltbmNtdHZvdW5uc3hxdmZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NTcxNjYsImV4cCI6MjA4ODEzMzE2Nn0.Z_a9HJbe6Q6YBvEKnXzSNKrgQo1P8hBwuMTEszSSlwo";
-const BRIGHT_DATA_API_KEY = "508f0e31-f341-4eed-8fc1-3ffcb24bbdd1";
 
-// Fetch Reddit posts via Bright Data API
-async function fetchRedditPosts() {
-  console.log("Fetching Montgomery Reddit posts via Bright Data...");
+const REDDIT_SOURCES = [
+  { url: "https://www.reddit.com/r/Montgomery/new.json?limit=25", source: "Reddit r/Montgomery" },
+  { url: "https://www.reddit.com/r/alabama/new.json?limit=25", source: "Reddit r/Alabama" },
+  { url: "https://www.reddit.com/r/Alabama/search.json?q=montgomery&sort=new&limit=25", source: "Reddit r/Alabama" },
+  { url: "https://www.reddit.com/r/news/search.json?q=montgomery+alabama&sort=new&limit=15", source: "Reddit r/News" },
+  { url: "https://www.reddit.com/r/politics/search.json?q=montgomery+alabama&sort=new&limit=10", source: "Reddit r/Politics" },
+];
 
-  const res = await fetch("https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_l7q7dkf244hwjntr0&include_errors=true", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${BRIGHT_DATA_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify([
-      { url: "https://www.reddit.com/r/Montgomery/new.json?limit=25" },
-      { url: "https://www.reddit.com/r/Montgomery/hot.json?limit=25" },
-    ]),
-  });
+const HEADERS = {
+  "User-Agent": "CitySignal/1.0 (civic misinformation detection; hackathon project)",
+};
 
-  console.log("Bright Data status:", res.status);
-
-  if (!res.ok) {
-    const err = await res.text();
-    console.log("Bright Data error:", err);
-    // Fall back to direct Reddit fetch
-    return await fetchRedditDirect();
-  }
-
+// Get existing post URLs to avoid duplicates
+async function getExistingUrls() {
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/flagged_posts?select=post_url&order=created_at.desc&limit=200`,
+    { headers: { "apikey": SUPABASE_KEY, "Authorization": `Bearer ${SUPABASE_KEY}` } }
+  );
   const data = await res.json();
-  console.log("Bright Data response:", JSON.stringify(data).slice(0, 200));
-  return data;
+  return new Set(data.map(p => p.post_url).filter(Boolean));
 }
 
-// Fallback: fetch Reddit directly
-async function fetchRedditDirect() {
-  console.log("Falling back to direct Reddit fetch...");
-
-  const res = await fetch("https://www.reddit.com/r/Montgomery/new.json?limit=25", {
-    headers: {
-      "User-Agent": "CitySignal/1.0 (civic misinformation detection; contact: citysignal@example.com)",
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Reddit fetch failed: ${res.status}`);
+// Fetch posts from a single Reddit source
+async function fetchFromReddit(url, sourceName) {
+  console.log(`Fetching from ${sourceName}...`);
+  try {
+    const res = await fetch(url, { headers: HEADERS });
+    if (!res.ok) {
+      console.log(`  ⚠ Failed: ${res.status}`);
+      return [];
+    }
+    const data = await res.json();
+    const children = data?.data?.children || [];
+    const posts = children.map(child => ({
+      title: child.data.title,
+      selftext: child.data.selftext || "",
+      author: child.data.author,
+      permalink: "https://reddit.com" + child.data.permalink,
+      created_utc: child.data.created_utc,
+      subreddit: child.data.subreddit,
+      score: child.data.score,
+      sourceName,
+    }));
+    console.log(`  ✓ Found ${posts.length} posts`);
+    return posts;
+  } catch (err) {
+    console.log(`  ⚠ Error: ${err.message}`);
+    return [];
   }
-
-  const data = await res.json();
-  const posts = data.data.children.map(child => ({
-    title: child.data.title,
-    selftext: child.data.selftext || "",
-    author: child.data.author,
-    permalink: "https://reddit.com" + child.data.permalink,
-    created_utc: child.data.created_utc,
-    subreddit: child.data.subreddit,
-    score: child.data.score,
-  }));
-
-  console.log(`Fetched ${posts.length} posts directly from Reddit`);
-  return posts;
 }
 
-// Save posts to Supabase
-async function savePosts(posts) {
-  if (!posts || posts.length === 0) {
-    console.log("No posts to save");
-    return;
-  }
+// Fetch Google News RSS for Montgomery
+async function fetchGoogleNews() {
+  console.log("Fetching Google News for Montgomery Alabama...");
+  try {
+    const queries = [
+      "Montgomery+Alabama+city",
+      "Montgomery+Alabama+crime",
+      "Montgomery+Alabama+emergency",
+      "Montgomery+Alabama+government",
+    ];
 
-  const normalized = posts
-    .filter(p => p.title || p.selftext)
+    const allPosts = [];
+
+    for (const query of queries) {
+      const url = `https://news.google.com/rss/search?q=${query}&hl=en-US&gl=US&ceid=US:en`;
+      const res = await fetch(url, { headers: HEADERS });
+      if (!res.ok) continue;
+
+      const text = await res.text();
+
+      // Parse RSS items
+      const items = text.match(/<item>([\s\S]*?)<\/item>/g) || [];
+      for (const item of items.slice(0, 10)) {
+        const title = item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)?.[1] ||
+                      item.match(/<title>(.*?)<\/title>/)?.[1] || "";
+        const link = item.match(/<link>(.*?)<\/link>/)?.[1] || "";
+        const pubDate = item.match(/<pubDate>(.*?)<\/pubDate>/)?.[1] || "";
+        const description = item.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>/)?.[1] ||
+                           item.match(/<description>(.*?)<\/description>/)?.[1] || "";
+
+        if (title && title.toLowerCase().includes("montgomery")) {
+          allPosts.push({
+            title: title.replace(/ - .*$/, "").trim(),
+            selftext: description.replace(/<[^>]*>/g, "").slice(0, 300),
+            author: "Google News",
+            permalink: link,
+            created_utc: pubDate ? new Date(pubDate).getTime() / 1000 : Date.now() / 1000,
+            sourceName: "Google News",
+          });
+        }
+      }
+
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    console.log(`  ✓ Found ${allPosts.length} news articles`);
+    return allPosts;
+  } catch (err) {
+    console.log(`  ⚠ Google News error: ${err.message}`);
+    return [];
+  }
+}
+
+// Save new posts to Supabase
+async function savePosts(posts, existingUrls) {
+  const newPosts = posts
+    .filter(p => !existingUrls.has(p.permalink))
+    .filter(p => (p.title || p.selftext).trim().length > 20)
     .map(p => ({
       post_text: (p.title || "") + (p.selftext ? " " + p.selftext : ""),
-      source: "Reddit r/Montgomery",
+      source: p.sourceName,
       author: p.author || "unknown",
       post_url: p.permalink || "",
       timestamp: p.created_utc ? new Date(p.created_utc * 1000).toISOString() : new Date().toISOString(),
       status: "pending",
-    }))
-    .filter(p => p.post_text.trim().length > 20);
+    }));
 
-  console.log(`Saving ${normalized.length} posts to Supabase...`);
+  if (newPosts.length === 0) {
+    console.log("No new posts to save — all already in database");
+    return 0;
+  }
+
+  console.log(`Saving ${newPosts.length} NEW posts to Supabase...`);
 
   const res = await fetch(`${SUPABASE_URL}/rest/v1/flagged_posts`, {
     method: "POST",
@@ -96,22 +140,22 @@ async function savePosts(posts) {
       "Authorization": `Bearer ${SUPABASE_KEY}`,
       "Prefer": "return=minimal",
     },
-    body: JSON.stringify(normalized),
+    body: JSON.stringify(newPosts),
   });
 
   if (!res.ok) {
     const err = await res.text();
     console.error("Supabase insert error:", err);
-    return;
+    return 0;
   }
 
-  console.log(`✓ Successfully saved ${normalized.length} posts!`);
+  console.log(`✓ Saved ${newPosts.length} new posts!`);
+  return newPosts.length;
 }
 
 // Trigger AI analysis
 async function triggerAnalysis() {
-  console.log("Triggering AI analysis...");
-
+  console.log("\nTriggering AI analysis...");
   const res = await fetch(`${SUPABASE_URL}/functions/v1/analyze-posts`, {
     method: "POST",
     headers: {
@@ -120,29 +164,41 @@ async function triggerAnalysis() {
     },
     body: JSON.stringify({}),
   });
-
   const data = await res.json();
   console.log("Analysis result:", JSON.stringify(data));
 }
 
 // Main
 async function main() {
-  try {
-    console.log("🚀 CitySignal Scraper Starting...\n");
+  console.log("🚀 CitySignal Multi-Source Scraper v2\n");
 
-    const posts = await fetchRedditDirect();
-    await savePosts(posts);
+  const existingUrls = await getExistingUrls();
+  console.log(`Found ${existingUrls.size} existing posts in database\n`);
 
-    console.log("\n⏳ Waiting 5 seconds before triggering analysis...");
-    await new Promise(r => setTimeout(r, 5000));
+  let allPosts = [];
 
-    await triggerAnalysis();
-
-    console.log("\n✅ Done! Check your dashboard at https://citysignal.vercel.app");
-
-  } catch (err) {
-    console.error("Error:", err.message);
+  // Fetch from all Reddit sources
+  for (const source of REDDIT_SOURCES) {
+    const posts = await fetchFromReddit(source.url, source.source);
+    allPosts = allPosts.concat(posts);
+    await new Promise(r => setTimeout(r, 1000));
   }
+
+  // Fetch from Google News
+  const newsPosts = await fetchGoogleNews();
+  allPosts = allPosts.concat(newsPosts);
+
+  console.log(`\nTotal posts fetched: ${allPosts.length}`);
+
+  const saved = await savePosts(allPosts, existingUrls);
+
+  if (saved > 0) {
+    console.log("\n⏳ Waiting 3 seconds before triggering analysis...");
+    await new Promise(r => setTimeout(r, 3000));
+    await triggerAnalysis();
+  }
+
+  console.log("\n✅ Done! Check your dashboard at https://citysignal.vercel.app");
 }
 
 main();
